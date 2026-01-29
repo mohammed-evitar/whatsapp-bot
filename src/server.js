@@ -1,0 +1,759 @@
+/**
+ * WhatsApp Web.js - Jira Integration
+ * 
+ * Listens to "Alloe.Life Product Engineering" group
+ * Commands: #add P0-P5 <task>, #p0, #p1, #today, etc.
+ */
+
+import express from 'express';
+import pkg from 'whatsapp-web.js';
+const { Client, LocalAuth } = pkg;
+import qrcode from 'qrcode-terminal';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+// Jira Config
+const JIRA_DOMAIN = process.env.JIRA_DOMAIN;
+const JIRA_EMAIL = process.env.JIRA_EMAIL;
+const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
+const JIRA_PROJECT_KEY = process.env.JIRA_PROJECT_KEY || 'KAN';
+
+// Priority mapping (P0-P5 to Jira priority IDs)
+// Jira default: Highest=1, High=2, Medium=3, Low=4, Lowest=5
+const PRIORITY_MAP = {
+    'p0': { id: '1', name: 'Highest (P0)' },
+    'p1': { id: '1', name: 'Highest (P1)' },
+    'p2': { id: '2', name: 'High (P2)' },
+    'p3': { id: '3', name: 'Medium (P3)' },
+    'p4': { id: '4', name: 'Low (P4)' },
+    'p5': { id: '5', name: 'Lowest (P5)' }
+};
+
+// State
+let client = null;
+let isReady = false;
+let clientInfo = null;
+
+const incomingMessages = [];
+const WATCHED_CONTACT = 'Alloe.Life Product Engineering';
+
+// Team members for quick assignment (shortcut -> search name)
+const TEAM_MEMBERS = {
+    'suhan': 'suhan ahmed',
+    'amit': 'Amit',
+    'mohammed': 'mohammed',
+    'mahesh': 'Mahesh Puli'
+};
+
+// ============================================
+// JIRA API FUNCTIONS
+// ============================================
+
+async function jiraRequest(endpoint, method = 'GET', body = null) {
+    const url = `https://${JIRA_DOMAIN}/rest/api/3${endpoint}`;
+    const auth = Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString('base64');
+    
+    const options = {
+        method,
+        headers: {
+            'Authorization': `Basic ${auth}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+    };
+    
+    if (body) {
+        options.body = JSON.stringify(body);
+    }
+    
+    const response = await fetch(url, options);
+    
+    if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`Jira API error: ${response.status} - ${error}`);
+    }
+    
+    // Handle empty response (like from transitions)
+    const text = await response.text();
+    if (!text) return {};
+    
+    return JSON.parse(text);
+}
+
+async function createJiraTask(fullText, priority) {
+    const priorityKey = priority.toLowerCase();
+    const priorityInfo = PRIORITY_MAP[priorityKey] || PRIORITY_MAP['p3'];
+    
+    // First 15 words as title, full text as description
+    const words = fullText.split(/\s+/);
+    const title = words.slice(0, 15).join(' ') + (words.length > 15 ? '...' : '');
+    const description = fullText;
+    
+    const body = {
+        fields: {
+            project: { key: JIRA_PROJECT_KEY },
+            summary: title,
+            description: {
+                type: 'doc',
+                version: 1,
+                content: [
+                    {
+                        type: 'paragraph',
+                        content: [
+                            {
+                                type: 'text',
+                                text: description
+                            }
+                        ]
+                    }
+                ]
+            },
+            issuetype: { name: 'Task' },
+            priority: { id: priorityInfo.id },
+            labels: [priorityKey.toUpperCase(), 'whatsapp-bot']
+        }
+    };
+    
+    const result = await jiraRequest('/issue', 'POST', body);
+    return {
+        key: result.key,
+        id: result.id,
+        title: title,
+        url: `https://${JIRA_DOMAIN}/browse/${result.key}`
+    };
+}
+
+async function searchJiraUser(query) {
+    // Search for user by name or email
+    const result = await jiraRequest(`/user/search?query=${encodeURIComponent(query)}&maxResults=1`);
+    if (result && result.length > 0) {
+        return result[0];
+    }
+    return null;
+}
+
+async function assignTicket(issueKey, accountId) {
+    await jiraRequest(`/issue/${issueKey}/assignee`, 'PUT', {
+        accountId: accountId
+    });
+}
+
+async function getTicketDetails(issueKey) {
+    const result = await jiraRequest(`/issue/${issueKey}?fields=summary,status,priority,assignee,reporter,created,updated,description,labels`);
+    return result;
+}
+
+async function markTicketDone(issueKey) {
+    // First get available transitions
+    const transitions = await jiraRequest(`/issue/${issueKey}/transitions`);
+    
+    // Find "Done" transition (usually id 31 or 41, but we search by name)
+    const doneTransition = transitions.transitions.find(t => 
+        t.name.toLowerCase().includes('done')
+    );
+    
+    if (!doneTransition) {
+        throw new Error('Could not find "Done" transition for this ticket');
+    }
+    
+    // Perform the transition
+    await jiraRequest(`/issue/${issueKey}/transitions`, 'POST', {
+        transition: { id: doneTransition.id }
+    });
+    
+    return { 
+        key: issueKey, 
+        status: 'Done',
+        url: `https://${JIRA_DOMAIN}/browse/${issueKey}`
+    };
+}
+
+async function uploadAttachmentToJira(issueKey, mediaData, filename) {
+    const url = `https://${JIRA_DOMAIN}/rest/api/3/issue/${issueKey}/attachments`;
+    const auth = Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString('base64');
+    
+    // Create form data boundary
+    const boundary = '----FormBoundary' + Date.now();
+    
+    // Convert base64 to buffer
+    const fileBuffer = Buffer.from(mediaData, 'base64');
+    
+    // Build multipart form data manually
+    const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+    const footer = `\r\n--${boundary}--\r\n`;
+    
+    const bodyBuffer = Buffer.concat([
+        Buffer.from(header),
+        fileBuffer,
+        Buffer.from(footer)
+    ]);
+    
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Basic ${auth}`,
+            'X-Atlassian-Token': 'no-check',
+            'Content-Type': `multipart/form-data; boundary=${boundary}`
+        },
+        body: bodyBuffer
+    });
+    
+    if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`Failed to upload attachment: ${response.status} - ${error}`);
+    }
+    
+    return response.json();
+}
+
+async function fetchJiraTasks(jql) {
+    // Using new /search/jql endpoint
+    const body = {
+        jql: jql,
+        maxResults: 20,
+        fields: ['summary', 'priority', 'status', 'created', 'labels']
+    };
+    const result = await jiraRequest('/search/jql', 'POST', body);
+    return result.issues || [];
+}
+
+async function getTodaysTasks() {
+    const jql = `project = ${JIRA_PROJECT_KEY} AND created >= startOfDay() ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getYesterdaysTasks() {
+    const jql = `project = ${JIRA_PROJECT_KEY} AND created >= startOfDay(-1) AND created < startOfDay() ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getThisWeeksTasks() {
+    const jql = `project = ${JIRA_PROJECT_KEY} AND created >= startOfWeek() ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getTasksByDate(date) {
+    // date format: YYYY-MM-DD
+    // Calculate next day
+    const dateObj = new Date(date);
+    dateObj.setDate(dateObj.getDate() + 1);
+    const nextDay = dateObj.toISOString().split('T')[0];
+    
+    const jql = `project = ${JIRA_PROJECT_KEY} AND created >= "${date}" AND created < "${nextDay}" ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getTasksByPriority(priority) {
+    const priorityKey = priority.toUpperCase();
+    // Search by label since we add priority as label
+    const jql = `project = ${JIRA_PROJECT_KEY} AND labels in ("${priorityKey}") AND status != Done ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getTasksByAssignee(assigneeName) {
+    // Search for open tasks assigned to this person (not done)
+    const jql = `project = ${JIRA_PROJECT_KEY} AND assignee = "${assigneeName}" AND status != Done ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getPendingTasksByAssignee(assigneeName) {
+    // Search for pending/To Do tasks only (not in progress, not done)
+    const jql = `project = ${JIRA_PROJECT_KEY} AND assignee = "${assigneeName}" AND status = "To Do" ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getAllTasksByAssignee(assigneeName) {
+    // Search for ALL tasks (including done) assigned to this person
+    const jql = `project = ${JIRA_PROJECT_KEY} AND assignee = "${assigneeName}" ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getAllOpenTasks() {
+    const jql = `project = ${JIRA_PROJECT_KEY} AND status != Done ORDER BY priority ASC, created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getAllTasksByPriority(priority) {
+    const priorityKey = priority.toUpperCase();
+    // All tasks of this priority (including done)
+    const jql = `project = ${JIRA_PROJECT_KEY} AND labels in ("${priorityKey}") ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+async function getAllTasks() {
+    // All tasks regardless of status
+    const jql = `project = ${JIRA_PROJECT_KEY} ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
+function formatTaskList(tasks, title) {
+    if (tasks.length === 0) {
+        return `📋 *${title}*\n\nNo tasks found.`;
+    }
+    
+    let msg = `📋 *${title}* (${tasks.length})\n\n`;
+    
+    tasks.forEach((task, i) => {
+        const priority = task.fields.labels?.find(l => /^P\d$/i.test(l)) || 'P3';
+        const status = task.fields.status?.name || 'Unknown';
+        const link = `https://${JIRA_DOMAIN}/browse/${task.key}`;
+        msg += `${i + 1}. *${task.key}* - ${task.fields.summary}\n`;
+        msg += `   ${priority} | ${status}\n`;
+        msg += `   🔗 ${link}\n\n`;
+    });
+    
+    return msg;
+}
+
+// ============================================
+// WHATSAPP CLIENT
+// ============================================
+
+function initializeClient() {
+    client = new Client({
+        authStrategy: new LocalAuth({
+            dataPath: process.env.SESSION_DATA_PATH || '.wwebjs_auth'
+        }),
+        puppeteer: {
+            headless: true,
+            executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        }
+    });
+
+    client.on('qr', (qr) => {
+        console.log('\n📱 Scan QR code:\n');
+        qrcode.generate(qr, { small: true });
+    });
+
+    client.on('authenticated', () => console.log('✅ Authenticated'));
+
+    client.on('ready', async () => {
+        isReady = true;
+        clientInfo = client.info;
+        console.log(`🚀 WhatsApp ready! (${clientInfo.pushname})\n`);
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log('🔌 Disconnected:', reason);
+        isReady = false;
+    });
+
+    // Listen for incoming messages
+    client.on('message', async (message) => {
+        const chat = await message.getChat();
+        const chatName = chat.name || '';
+        
+        if (chatName.toLowerCase().includes(WATCHED_CONTACT.toLowerCase())) {
+            console.log(`📨 ${chatName}: ${message.body}`);
+            incomingMessages.push({
+                body: message.body,
+                time: new Date().toLocaleString()
+            });
+        }
+    });
+
+    // Listen for commands from ANYONE in the watched group (including yourself)
+    client.on('message_create', async (message) => {
+        const body = message.body.trim();
+        if (!body.startsWith('#')) return;
+        
+        const chat = await message.getChat();
+        const chatName = chat.name || '';
+        
+        if (!chatName.toLowerCase().includes(WATCHED_CONTACT.toLowerCase())) return;
+        
+        let senderName = 'Unknown';
+        if (message.fromMe) {
+            senderName = 'You';
+        } else {
+            try {
+                const contact = await message.getContact();
+                senderName = contact.pushname || contact.number || 'Unknown';
+            } catch (e) {
+                senderName = 'Group Member';
+            }
+        }
+        
+        const command = body.toLowerCase();
+        console.log(`\n⚡ COMMAND from ${senderName}: ${body}`);
+        
+        try {
+            // #help
+            if (command === '#help') {
+                await message.reply(`🤖 *Jira Bot Commands*\n
+*Add Tasks:*
+#addP0 <title> - Critical
+#addP1 <title> - Highest
+#addP2 <title> - High
+#addP3 <title> - Medium
+#addP4 <title> - Low
+#addP5 <title> - Lowest
+
+📎 *With Image:* Send image with caption #addP1 description
+📎 *Or:* Reply to an image with #addP1 description
+👤 *Assign:* #addP1 Fix bug =suhan
+
+*Fetch Open Tasks:*
+#p0 - Open P0 tasks
+#p1 - Open P1 tasks
+#tasks - All open tasks
+
+*By Team Member:*
+#pending suhan - Suhan's To Do tasks
+#tasks suhan - Suhan's open tasks
+#alltasks suhan - All Suhan's tasks
+
+*Fetch by Date:*
+#today - Today's tasks
+#yesterday - Yesterday's tasks
+#week - This week's tasks
+#date 2026-01-29 - Specific date
+
+*Fetch All (incl. done):*
+#allp0 - All P0 tickets
+#allp1 - All P1 tickets
+#all - All tickets
+
+*Ticket Actions:*
+#ticket KAN-4 - View ticket details
+#done KAN-4 - Mark ticket as done
+
+*Other:*
+#ping - Check bot
+#status - Bot status
+#team - Show team members`);
+            }
+            
+            // #ping
+            else if (command === '#ping') {
+                await message.reply('🏓 Pong!');
+            }
+            
+            // #status
+            else if (command === '#status') {
+                const mins = Math.floor(process.uptime() / 60);
+                await message.reply(`✅ Bot running ${mins} mins\nJira: ${JIRA_DOMAIN}\nProject: ${JIRA_PROJECT_KEY}`);
+            }
+            
+            // #team - Show team members
+            else if (command === '#team') {
+                const members = Object.entries(TEAM_MEMBERS)
+                    .map(([shortcut, name]) => `=${shortcut} → ${name}`)
+                    .join('\n');
+                await message.reply(`👥 *Team Members*\n\n${members}\n\nUse: #addP1 Task description =suhan`);
+            }
+            
+            // #addP0, #addP1, #addP2, #addP3, #addP4, #addP5 <task> [@assignee]
+            else if (/^#addp[0-5]\s/.test(command)) {
+                const match = body.match(/^#addp([0-5])\s+(.+)$/i);
+                
+                if (!match) {
+                    await message.reply('❌ Format: #addP1 Task title here\nWith assignee: #addP1 Task title @PersonName');
+                    return;
+                }
+                
+                const priority = `p${match[1]}`;
+                let taskText = match[2];
+                
+                // Check if there's an assignee (=name at the end)
+                let assigneeName = null;
+                const assigneeMatch = taskText.match(/\s+=(\S+)$/);
+                if (assigneeMatch) {
+                    assigneeName = assigneeMatch[1];
+                    taskText = taskText.replace(/\s+=\S+$/, '').trim();
+                }
+                
+                await message.reply(`⏳ Creating ${priority.toUpperCase()} task...`);
+                
+                const result = await createJiraTask(taskText, priority);
+                
+                // Try to assign if assignee specified
+                let assigneeInfo = '';
+                if (assigneeName) {
+                    try {
+                        // Check if it's a team shortcut
+                        const searchName = TEAM_MEMBERS[assigneeName.toLowerCase()] || assigneeName;
+                        const user = await searchJiraUser(searchName);
+                        if (user) {
+                            await assignTicket(result.key, user.accountId);
+                            assigneeInfo = `\n👤 Assigned to: ${user.displayName}`;
+                            console.log(`   → Assigned to ${user.displayName}`);
+                        } else {
+                            assigneeInfo = `\n⚠️ User "${assigneeName}" not found`;
+                        }
+                    } catch (err) {
+                        console.error('Assign error:', err.message);
+                        assigneeInfo = `\n⚠️ Could not assign to ${assigneeName}`;
+                    }
+                }
+                
+                // Check if message has media (image attached)
+                let attachmentInfo = '';
+                if (message.hasMedia) {
+                    try {
+                        const media = await message.downloadMedia();
+                        if (media) {
+                            const ext = media.mimetype.split('/')[1] || 'jpg';
+                            const filename = `whatsapp_${Date.now()}.${ext}`;
+                            await uploadAttachmentToJira(result.key, media.data, filename);
+                            attachmentInfo = '\n📎 Image attached';
+                            console.log(`   → Attachment uploaded`);
+                        }
+                    } catch (err) {
+                        console.error('Attachment error:', err.message);
+                        attachmentInfo = '\n⚠️ Failed to attach image';
+                    }
+                }
+                
+                // Check if replying to a message with media
+                if (message.hasQuotedMsg) {
+                    try {
+                        const quotedMsg = await message.getQuotedMessage();
+                        if (quotedMsg.hasMedia) {
+                            const media = await quotedMsg.downloadMedia();
+                            if (media) {
+                                const ext = media.mimetype.split('/')[1] || 'jpg';
+                                const filename = `whatsapp_${Date.now()}.${ext}`;
+                                await uploadAttachmentToJira(result.key, media.data, filename);
+                                attachmentInfo = '\n📎 Image attached';
+                                console.log(`   → Attachment from quoted message uploaded`);
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Quoted attachment error:', err.message);
+                    }
+                }
+                
+                await message.reply(`✅ *Task Created*\n\n*${result.key}* (${priority.toUpperCase()})\n${result.title}${assigneeInfo}${attachmentInfo}\n\n🔗 ${result.url}`);
+                console.log(`   → Created ${result.key}`);
+            }
+            
+            // #today
+            else if (command === '#today') {
+                await message.reply('⏳ Fetching today\'s tasks...');
+                const tasks = await getTodaysTasks();
+                const response = formatTaskList(tasks, "Today's Tasks");
+                await message.reply(response);
+            }
+            
+            // #yesterday
+            else if (command === '#yesterday') {
+                await message.reply('⏳ Fetching yesterday\'s tasks...');
+                const tasks = await getYesterdaysTasks();
+                const response = formatTaskList(tasks, "Yesterday's Tasks");
+                await message.reply(response);
+            }
+            
+            // #week
+            else if (command === '#week') {
+                await message.reply('⏳ Fetching this week\'s tasks...');
+                const tasks = await getThisWeeksTasks();
+                const response = formatTaskList(tasks, "This Week's Tasks");
+                await message.reply(response);
+            }
+            
+            // #date YYYY-MM-DD
+            else if (command.startsWith('#date ')) {
+                const match = body.match(/^#date\s+(\d{4}-\d{2}-\d{2})$/i);
+                
+                if (!match) {
+                    await message.reply('❌ Format: #date 2026-01-29');
+                    return;
+                }
+                
+                const date = match[1];
+                await message.reply(`⏳ Fetching tasks from ${date}...`);
+                const tasks = await getTasksByDate(date);
+                const response = formatTaskList(tasks, `Tasks from ${date}`);
+                await message.reply(response);
+            }
+            
+            // #p0, #p1, #p2, #p3, #p4, #p5
+            else if (/^#p[0-5]$/.test(command)) {
+                const priority = command.substring(1);
+                await message.reply(`⏳ Fetching ${priority.toUpperCase()} tasks...`);
+                const tasks = await getTasksByPriority(priority);
+                const response = formatTaskList(tasks, `${priority.toUpperCase()} Tasks`);
+                await message.reply(response);
+            }
+            
+            // #tasks
+            else if (command === '#tasks') {
+                await message.reply('⏳ Fetching all open tasks...');
+                const tasks = await getAllOpenTasks();
+                const response = formatTaskList(tasks, 'All Open Tasks');
+                await message.reply(response);
+            }
+            
+            // #tasks suhan - Get tasks assigned to a team member
+            else if (command.startsWith('#tasks ')) {
+                const shortcut = body.substring(7).trim().toLowerCase();
+                const searchName = TEAM_MEMBERS[shortcut];
+                
+                if (!searchName) {
+                    const validNames = Object.keys(TEAM_MEMBERS).join(', ');
+                    await message.reply(`❌ Unknown team member: ${shortcut}\n\nValid: ${validNames}`);
+                    return;
+                }
+                
+                await message.reply(`⏳ Fetching ${shortcut}'s open tasks...`);
+                const tasks = await getTasksByAssignee(searchName);
+                const response = formatTaskList(tasks, `${shortcut.charAt(0).toUpperCase() + shortcut.slice(1)}'s Tasks`);
+                await message.reply(response);
+            }
+            
+            // #pending suhan - Get pending (To Do) tasks for a team member
+            else if (command.startsWith('#pending ')) {
+                const shortcut = body.substring(9).trim().toLowerCase();
+                const searchName = TEAM_MEMBERS[shortcut];
+                
+                if (!searchName) {
+                    const validNames = Object.keys(TEAM_MEMBERS).join(', ');
+                    await message.reply(`❌ Unknown team member: ${shortcut}\n\nValid: ${validNames}`);
+                    return;
+                }
+                
+                await message.reply(`⏳ Fetching ${shortcut}'s pending tasks...`);
+                const tasks = await getPendingTasksByAssignee(searchName);
+                const response = formatTaskList(tasks, `${shortcut.charAt(0).toUpperCase() + shortcut.slice(1)}'s Pending Tasks`);
+                await message.reply(response);
+            }
+            
+            // #alltasks suhan - Get ALL tasks (including done) for a team member
+            else if (command.startsWith('#alltasks ')) {
+                const shortcut = body.substring(10).trim().toLowerCase();
+                const searchName = TEAM_MEMBERS[shortcut];
+                
+                if (!searchName) {
+                    const validNames = Object.keys(TEAM_MEMBERS).join(', ');
+                    await message.reply(`❌ Unknown team member: ${shortcut}\n\nValid: ${validNames}`);
+                    return;
+                }
+                
+                await message.reply(`⏳ Fetching all ${shortcut}'s tasks...`);
+                const tasks = await getAllTasksByAssignee(searchName);
+                const response = formatTaskList(tasks, `All ${shortcut.charAt(0).toUpperCase() + shortcut.slice(1)}'s Tasks`);
+                await message.reply(response);
+            }
+            
+            // #allp0, #allp1, etc. - All tickets of priority (including done)
+            else if (/^#allp[0-5]$/.test(command)) {
+                const priorityNum = command.substring(5); // get 0, 1, etc.
+                await message.reply(`⏳ Fetching all P${priorityNum} tickets...`);
+                const tasks = await getAllTasksByPriority(`P${priorityNum}`);
+                const response = formatTaskList(tasks, `All P${priorityNum} Tickets`);
+                await message.reply(response);
+            }
+            
+            // #all - All tickets
+            else if (command === '#all') {
+                await message.reply('⏳ Fetching all tickets...');
+                const tasks = await getAllTasks();
+                const response = formatTaskList(tasks, 'All Tickets');
+                await message.reply(response);
+            }
+            
+            // #ticket KAN-XX - Get ticket details
+            else if (command.startsWith('#ticket ')) {
+                const match = body.match(/^#ticket\s+(\S+)$/i);
+                
+                if (!match) {
+                    await message.reply('❌ Format: #ticket KAN-4');
+                    return;
+                }
+                
+                const ticketKey = match[1].toUpperCase();
+                await message.reply(`⏳ Fetching ${ticketKey}...`);
+                
+                const ticket = await getTicketDetails(ticketKey);
+                const fields = ticket.fields;
+                
+                const priority = fields.labels?.find(l => /^P\d$/i.test(l)) || 'N/A';
+                const status = fields.status?.name || 'Unknown';
+                const assignee = fields.assignee?.displayName || 'Unassigned';
+                const reporter = fields.reporter?.displayName || 'Unknown';
+                const created = new Date(fields.created).toLocaleDateString();
+                const updated = new Date(fields.updated).toLocaleDateString();
+                
+                let details = `📋 *${ticketKey}*\n\n`;
+                details += `*Title:* ${fields.summary}\n`;
+                details += `*Priority:* ${priority}\n`;
+                details += `*Status:* ${status}\n`;
+                details += `*Assignee:* ${assignee}\n`;
+                details += `*Reporter:* ${reporter}\n`;
+                details += `*Created:* ${created}\n`;
+                details += `*Updated:* ${updated}\n`;
+                details += `\n🔗 https://${JIRA_DOMAIN}/browse/${ticketKey}`;
+                
+                await message.reply(details);
+                console.log(`   → Fetched ${ticketKey} details`);
+            }
+            
+            // #done KAN-XX - Mark ticket as done
+            else if (command.startsWith('#done ')) {
+                const match = body.match(/^#done\s+(\S+)$/i);
+                
+                if (!match) {
+                    await message.reply('❌ Format: #done KAN-4');
+                    return;
+                }
+                
+                const ticketKey = match[1].toUpperCase();
+                await message.reply(`⏳ Marking ${ticketKey} as done...`);
+                
+                const result = await markTicketDone(ticketKey);
+                await message.reply(`✅ *${result.key}* marked as Done!\n\n🔗 ${result.url}`);
+                console.log(`   → ${ticketKey} marked as Done`);
+            }
+            
+        } catch (error) {
+            console.error('Command error:', error.message);
+            await message.reply(`❌ Error: ${error.message}`);
+        }
+    });
+
+    console.log('🔄 Initializing WhatsApp...\n');
+    client.initialize();
+}
+
+// ============================================
+// API ROUTES
+// ============================================
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', ready: isReady, jira: JIRA_DOMAIN });
+});
+
+app.get('/status', (req, res) => {
+    res.json({
+        ready: isReady,
+        user: clientInfo?.pushname || null,
+        jira: { domain: JIRA_DOMAIN, project: JIRA_PROJECT_KEY }
+    });
+});
+
+// ============================================
+// START
+// ============================================
+
+app.listen(PORT, () => {
+    console.log(`\n🌐 Server: http://localhost:${PORT}`);
+    console.log(`\n📋 Jira: ${JIRA_DOMAIN} (${JIRA_PROJECT_KEY})`);
+    console.log(`👀 Watching: ${WATCHED_CONTACT}`);
+    console.log(`\n💬 Commands: #help #addP1 <task> #today #p1 #tasks\n`);
+    
+    initializeClient();
+});
+
+process.on('SIGINT', async () => {
+    console.log('\n👋 Shutting down...');
+    if (client) await client.destroy();
+    process.exit(0);
+});
