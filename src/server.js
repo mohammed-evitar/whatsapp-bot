@@ -425,6 +425,11 @@ function initializeClient() {
 #ticket KAN-4 - View ticket details
 #done KAN-4 - Mark ticket as done
 
+*Chat History:*
+#history - Last 20 messages
+#history 50 - Last 50 messages
+#search keyword - Search messages
+
 *Other:*
 #ping - Check bot
 #status - Bot status
@@ -455,7 +460,7 @@ function initializeClient() {
                 const match = body.match(/^#addp([0-5])\s+(.+)$/i);
                 
                 if (!match) {
-                    await message.reply('❌ Format: #addP1 Task title here\nWith assignee: #addP1 Task title @PersonName');
+                    await message.reply('❌ Format: #addP1 Task title here\nWith assignee: #addP1 Task title =suhan');
                     return;
                 }
                 
@@ -470,32 +475,30 @@ function initializeClient() {
                     taskText = taskText.replace(/\s+=\S+$/, '').trim();
                 }
                 
-                await message.reply(`⏳ Creating ${priority.toUpperCase()} task...`);
-                
+                // Create task (no "Creating..." message - just react when done)
                 const result = await createJiraTask(taskText, priority);
                 
                 // Try to assign if assignee specified
-                let assigneeInfo = '';
+                let hasWarning = false;
                 if (assigneeName) {
                     try {
-                        // Check if it's a team shortcut
                         const searchName = TEAM_MEMBERS[assigneeName.toLowerCase()] || assigneeName;
                         const user = await searchJiraUser(searchName);
                         if (user) {
                             await assignTicket(result.key, user.accountId);
-                            assigneeInfo = `\n👤 Assigned to: ${user.displayName}`;
                             console.log(`   → Assigned to ${user.displayName}`);
                         } else {
-                            assigneeInfo = `\n⚠️ User "${assigneeName}" not found`;
+                            hasWarning = true;
+                            await message.reply(`⚠️ Created ${result.key} but user "${assigneeName}" not found\n🔗 ${result.url}`);
                         }
                     } catch (err) {
                         console.error('Assign error:', err.message);
-                        assigneeInfo = `\n⚠️ Could not assign to ${assigneeName}`;
+                        hasWarning = true;
+                        await message.reply(`⚠️ Created ${result.key} but couldn't assign to ${assigneeName}\n🔗 ${result.url}`);
                     }
                 }
                 
                 // Check if message has media (image attached)
-                let attachmentInfo = '';
                 if (message.hasMedia) {
                     try {
                         const media = await message.downloadMedia();
@@ -503,12 +506,10 @@ function initializeClient() {
                             const ext = media.mimetype.split('/')[1] || 'jpg';
                             const filename = `whatsapp_${Date.now()}.${ext}`;
                             await uploadAttachmentToJira(result.key, media.data, filename);
-                            attachmentInfo = '\n📎 Image attached';
                             console.log(`   → Attachment uploaded`);
                         }
                     } catch (err) {
                         console.error('Attachment error:', err.message);
-                        attachmentInfo = '\n⚠️ Failed to attach image';
                     }
                 }
                 
@@ -522,7 +523,6 @@ function initializeClient() {
                                 const ext = media.mimetype.split('/')[1] || 'jpg';
                                 const filename = `whatsapp_${Date.now()}.${ext}`;
                                 await uploadAttachmentToJira(result.key, media.data, filename);
-                                attachmentInfo = '\n📎 Image attached';
                                 console.log(`   → Attachment from quoted message uploaded`);
                             }
                         }
@@ -531,13 +531,20 @@ function initializeClient() {
                     }
                 }
                 
-                await message.reply(`✅ *Task Created*\n\n*${result.key}* (${priority.toUpperCase()})\n${result.title}${assigneeInfo}${attachmentInfo}\n\n🔗 ${result.url}`);
+                // React with 👍 on success (no message unless there was a warning)
+                if (!hasWarning) {
+                    try {
+                        await message.react('👍');
+                    } catch (reactErr) {
+                        // If react fails, send minimal confirmation
+                        await message.reply(`✅ ${result.key}\n🔗 ${result.url}`);
+                    }
+                }
                 console.log(`   → Created ${result.key}`);
             }
             
             // #today
             else if (command === '#today') {
-                await message.reply('⏳ Fetching today\'s tasks...');
                 const tasks = await getTodaysTasks();
                 const response = formatTaskList(tasks, "Today's Tasks");
                 await message.reply(response);
@@ -545,7 +552,6 @@ function initializeClient() {
             
             // #yesterday
             else if (command === '#yesterday') {
-                await message.reply('⏳ Fetching yesterday\'s tasks...');
                 const tasks = await getYesterdaysTasks();
                 const response = formatTaskList(tasks, "Yesterday's Tasks");
                 await message.reply(response);
@@ -553,7 +559,6 @@ function initializeClient() {
             
             // #week
             else if (command === '#week') {
-                await message.reply('⏳ Fetching this week\'s tasks...');
                 const tasks = await getThisWeeksTasks();
                 const response = formatTaskList(tasks, "This Week's Tasks");
                 await message.reply(response);
@@ -569,7 +574,6 @@ function initializeClient() {
                 }
                 
                 const date = match[1];
-                await message.reply(`⏳ Fetching tasks from ${date}...`);
                 const tasks = await getTasksByDate(date);
                 const response = formatTaskList(tasks, `Tasks from ${date}`);
                 await message.reply(response);
@@ -578,7 +582,6 @@ function initializeClient() {
             // #p0, #p1, #p2, #p3, #p4, #p5
             else if (/^#p[0-5]$/.test(command)) {
                 const priority = command.substring(1);
-                await message.reply(`⏳ Fetching ${priority.toUpperCase()} tasks...`);
                 const tasks = await getTasksByPriority(priority);
                 const response = formatTaskList(tasks, `${priority.toUpperCase()} Tasks`);
                 await message.reply(response);
@@ -586,7 +589,6 @@ function initializeClient() {
             
             // #tasks
             else if (command === '#tasks') {
-                await message.reply('⏳ Fetching all open tasks...');
                 const tasks = await getAllOpenTasks();
                 const response = formatTaskList(tasks, 'All Open Tasks');
                 await message.reply(response);
@@ -603,7 +605,6 @@ function initializeClient() {
                     return;
                 }
                 
-                await message.reply(`⏳ Fetching ${shortcut}'s open tasks...`);
                 const tasks = await getTasksByAssignee(searchName);
                 const response = formatTaskList(tasks, `${shortcut.charAt(0).toUpperCase() + shortcut.slice(1)}'s Tasks`);
                 await message.reply(response);
@@ -620,7 +621,6 @@ function initializeClient() {
                     return;
                 }
                 
-                await message.reply(`⏳ Fetching ${shortcut}'s pending tasks...`);
                 const tasks = await getPendingTasksByAssignee(searchName);
                 const response = formatTaskList(tasks, `${shortcut.charAt(0).toUpperCase() + shortcut.slice(1)}'s Pending Tasks`);
                 await message.reply(response);
@@ -637,7 +637,6 @@ function initializeClient() {
                     return;
                 }
                 
-                await message.reply(`⏳ Fetching all ${shortcut}'s tasks...`);
                 const tasks = await getAllTasksByAssignee(searchName);
                 const response = formatTaskList(tasks, `All ${shortcut.charAt(0).toUpperCase() + shortcut.slice(1)}'s Tasks`);
                 await message.reply(response);
@@ -645,8 +644,7 @@ function initializeClient() {
             
             // #allp0, #allp1, etc. - All tickets of priority (including done)
             else if (/^#allp[0-5]$/.test(command)) {
-                const priorityNum = command.substring(5); // get 0, 1, etc.
-                await message.reply(`⏳ Fetching all P${priorityNum} tickets...`);
+                const priorityNum = command.substring(5);
                 const tasks = await getAllTasksByPriority(`P${priorityNum}`);
                 const response = formatTaskList(tasks, `All P${priorityNum} Tickets`);
                 await message.reply(response);
@@ -654,7 +652,6 @@ function initializeClient() {
             
             // #all - All tickets
             else if (command === '#all') {
-                await message.reply('⏳ Fetching all tickets...');
                 const tasks = await getAllTasks();
                 const response = formatTaskList(tasks, 'All Tickets');
                 await message.reply(response);
@@ -670,8 +667,6 @@ function initializeClient() {
                 }
                 
                 const ticketKey = match[1].toUpperCase();
-                await message.reply(`⏳ Fetching ${ticketKey}...`);
-                
                 const ticket = await getTicketDetails(ticketKey);
                 const fields = ticket.fields;
                 
@@ -706,11 +701,79 @@ function initializeClient() {
                 }
                 
                 const ticketKey = match[1].toUpperCase();
-                await message.reply(`⏳ Marking ${ticketKey} as done...`);
-                
                 const result = await markTicketDone(ticketKey);
-                await message.reply(`✅ *${result.key}* marked as Done!\n\n🔗 ${result.url}`);
+                
+                // React with ✅ on success
+                try {
+                    await message.react('✅');
+                } catch (reactErr) {
+                    await message.reply(`✅ ${result.key} Done\n🔗 ${result.url}`);
+                }
                 console.log(`   → ${ticketKey} marked as Done`);
+            }
+            
+            // #history - Fetch recent messages from this group
+            else if (command === '#history' || command.startsWith('#history ')) {
+                const match = body.match(/^#history\s*(\d*)$/i);
+                const limit = match && match[1] ? parseInt(match[1]) : 20;
+                const maxLimit = 50;
+                const fetchLimit = Math.min(limit, maxLimit);
+                
+                const chat = await message.getChat();
+                const messages = await chat.fetchMessages({ limit: fetchLimit });
+                
+                let history = `📜 *Last ${messages.length} Messages*\n\n`;
+                
+                for (const msg of messages.reverse()) {
+                    const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { 
+                        hour: '2-digit', 
+                        minute: '2-digit' 
+                    });
+                    const sender = msg.fromMe ? 'You' : (msg._data.notifyName || 'Unknown');
+                    const text = msg.body?.substring(0, 100) || '[media]';
+                    history += `[${time}] *${sender}*: ${text}${msg.body?.length > 100 ? '...' : ''}\n`;
+                }
+                
+                await message.reply(history);
+                console.log(`   → Fetched ${messages.length} messages`);
+            }
+            
+            // #search <query> - Search messages in this group
+            else if (command.startsWith('#search ')) {
+                const query = body.substring(8).trim().toLowerCase();
+                
+                if (!query) {
+                    await message.reply('❌ Format: #search keyword');
+                    return;
+                }
+                
+                const chat = await message.getChat();
+                const messages = await chat.fetchMessages({ limit: 100 });
+                
+                const matches = messages.filter(msg => 
+                    msg.body?.toLowerCase().includes(query)
+                ).slice(0, 10);
+                
+                if (matches.length === 0) {
+                    await message.reply(`❌ No messages found containing "${query}"`);
+                    return;
+                }
+                
+                let results = `🔍 *Search: "${query}"* (${matches.length} found)\n\n`;
+                
+                for (const msg of matches) {
+                    const date = new Date(msg.timestamp * 1000).toLocaleDateString();
+                    const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { 
+                        hour: '2-digit', 
+                        minute: '2-digit' 
+                    });
+                    const sender = msg.fromMe ? 'You' : (msg._data.notifyName || 'Unknown');
+                    const text = msg.body?.substring(0, 80) || '[media]';
+                    results += `[${date} ${time}] *${sender}*:\n${text}${msg.body?.length > 80 ? '...' : ''}\n\n`;
+                }
+                
+                await message.reply(results);
+                console.log(`   → Found ${matches.length} messages for "${query}"`);
             }
             
         } catch (error) {
