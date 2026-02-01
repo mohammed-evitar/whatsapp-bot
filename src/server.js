@@ -1,8 +1,8 @@
 /**
- * WhatsApp Web.js - Jira Integration
+ * WhatsApp Web.js - Jira Integration + Alloe AI
  * 
  * Listens to "Alloe.Life Product Engineering" group
- * Commands: #add P0-P5 <task>, #p0, #p1, #today, etc.
+ * Commands: #add P0-P5 <task>, #p0, #p1, #today, #ask, etc.
  */
 
 import express from 'express';
@@ -10,8 +10,14 @@ import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth } = pkg;
 import qrcode from 'qrcode-terminal';
 import dotenv from 'dotenv';
+import OpenAI from 'openai';
 
 dotenv.config();
+
+// OpenAI Client
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
 
 const app = express();
 app.use(express.json());
@@ -292,6 +298,12 @@ async function getAllTasks() {
     return fetchJiraTasks(jql);
 }
 
+async function getTasksByPriorityAndAssignee(priority, assigneeName) {
+    const priorityKey = priority.toUpperCase();
+    const jql = `project = ${JIRA_PROJECT_KEY} AND labels in ("${priorityKey}") AND assignee = "${assigneeName}" ORDER BY created DESC`;
+    return fetchJiraTasks(jql);
+}
+
 function formatTaskList(tasks, title) {
     if (tasks.length === 0) {
         return `📋 *${title}*\n\nNo tasks found.`;
@@ -309,6 +321,334 @@ function formatTaskList(tasks, title) {
     });
     
     return msg;
+}
+
+// ============================================
+// OPENAI FUNCTIONS
+// ============================================
+
+// Define tools for OpenAI function calling
+const openaiTools = [
+    {
+        type: 'function',
+        function: {
+            name: 'create_task',
+            description: 'Create a new Jira task with specified priority',
+            parameters: {
+                type: 'object',
+                properties: {
+                    title: { type: 'string', description: 'Task title/description' },
+                    priority: { type: 'string', enum: ['p0', 'p1', 'p2', 'p3', 'p4', 'p5'], description: 'Priority level (p0=critical, p1=highest, p2=high, p3=medium, p4=low, p5=lowest)' },
+                    assignee: { type: 'string', description: 'Team member to assign (optional): suhan, amit, mohammed, mahesh' }
+                },
+                required: ['title', 'priority']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_tasks_by_priority',
+            description: 'Get open tasks filtered by priority level',
+            parameters: {
+                type: 'object',
+                properties: {
+                    priority: { type: 'string', enum: ['p0', 'p1', 'p2', 'p3', 'p4', 'p5'], description: 'Priority level to filter' }
+                },
+                required: ['priority']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_tasks_by_assignee',
+            description: 'Get tasks assigned to a team member',
+            parameters: {
+                type: 'object',
+                properties: {
+                    assignee: { type: 'string', description: 'Team member name: suhan, amit, mohammed, mahesh' },
+                    status: { type: 'string', enum: ['open', 'pending', 'all'], description: 'Filter by status: open (not done), pending (to do only), all (including done)' }
+                },
+                required: ['assignee']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_tasks_by_priority_and_assignee',
+            description: 'Get tasks filtered by BOTH priority level AND assignee. Use this when user asks for tasks of a specific priority from a specific person.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    priority: { type: 'string', enum: ['p0', 'p1', 'p2', 'p3', 'p4', 'p5'], description: 'Priority level' },
+                    assignee: { type: 'string', description: 'Team member name: suhan, amit, mohammed, mahesh' }
+                },
+                required: ['priority', 'assignee']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_tasks_by_date',
+            description: 'Get tasks created on a specific date or time range',
+            parameters: {
+                type: 'object',
+                properties: {
+                    period: { type: 'string', enum: ['today', 'yesterday', 'week'], description: 'Time period' },
+                    date: { type: 'string', description: 'Specific date in YYYY-MM-DD format (optional, use instead of period)' }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_all_tasks',
+            description: 'Get all open tasks or all tasks',
+            parameters: {
+                type: 'object',
+                properties: {
+                    include_done: { type: 'boolean', description: 'Include completed tasks (default false)' }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_ticket_details',
+            description: 'Get details of a specific Jira ticket',
+            parameters: {
+                type: 'object',
+                properties: {
+                    ticket_key: { type: 'string', description: 'Jira ticket key like KAN-4' }
+                },
+                required: ['ticket_key']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'mark_ticket_done',
+            description: 'Mark a Jira ticket as done/completed',
+            parameters: {
+                type: 'object',
+                properties: {
+                    ticket_key: { type: 'string', description: 'Jira ticket key like KAN-4' }
+                },
+                required: ['ticket_key']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'chat_response',
+            description: 'Respond to general questions, chat analysis, or conversation summaries',
+            parameters: {
+                type: 'object',
+                properties: {
+                    response: { type: 'string', description: 'The response message to send' }
+                },
+                required: ['response']
+            }
+        }
+    }
+];
+
+async function processAIRequest(chatMessages, userQuery) {
+    // Format chat history for context
+    const chatContext = chatMessages.map(msg => {
+        const time = new Date(msg.timestamp * 1000).toLocaleString();
+        const sender = msg.fromMe ? 'You' : (msg._data?.notifyName || 'User');
+        return `[${time}] ${sender}: ${msg.body || '[media]'}`;
+    }).join('\n');
+    
+    const systemPrompt = `You are Alloe, a Lifemaxing AI assistant in a WhatsApp group that helps manage Jira tasks and team productivity. You are helpful, concise, and friendly. You can:
+
+1. CREATE TASKS: When user wants to add/create a task, use create_task function
+   - "add a P1 task for fixing login" → create_task(title="fixing login", priority="p1")
+   - "create urgent task about payment bug assign to suhan" → create_task(title="payment bug", priority="p0", assignee="suhan")
+
+2. FETCH TASKS: When user wants to see/list/show tasks
+   - "show P0 tasks" → get_tasks_by_priority(priority="p0")
+   - "what are suhan's tasks" → get_tasks_by_assignee(assignee="suhan", status="open")
+   - "show all pending tasks for amit" → get_tasks_by_assignee(assignee="amit", status="pending")
+   - "get all P0 from mohammed" → get_tasks_by_priority_and_assignee(priority="p0", assignee="mohammed")
+   - "suhan's P1 tasks" → get_tasks_by_priority_and_assignee(priority="p1", assignee="suhan")
+   - "today's tasks" → get_tasks_by_date(period="today")
+   - "all open tasks" → get_all_tasks(include_done=false)
+
+3. TICKET ACTIONS:
+   - "details of KAN-5" → get_ticket_details(ticket_key="KAN-5")
+   - "mark KAN-5 as done" → mark_ticket_done(ticket_key="KAN-5")
+
+4. CHAT/GENERAL: For summaries, analysis, or general questions → use chat_response
+
+Priority guide: p0/p1=critical/urgent, p2=high, p3=medium, p4=low, p5=lowest
+Team: suhan, amit, mohammed, mahesh
+
+Current Jira project: ${JIRA_PROJECT_KEY}
+
+Remember: You are Alloe - be helpful and keep responses concise for WhatsApp.`;
+
+    const userMessage = `Recent chat messages:\n${chatContext}\n\n---\nUser request: ${userQuery}`;
+    
+    try {
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage }
+            ],
+            tools: openaiTools,
+            tool_choice: 'required',
+            max_tokens: 1000,
+            temperature: 0.3
+        });
+        
+        const message = response.choices[0].message;
+        
+        if (message.tool_calls && message.tool_calls.length > 0) {
+            const toolCall = message.tool_calls[0];
+            const functionName = toolCall.function.name;
+            const args = JSON.parse(toolCall.function.arguments);
+            
+            console.log(`   → AI detected: ${functionName}`, args);
+            
+            return { action: functionName, args: args };
+        }
+        
+        // Fallback to text response
+        return { action: 'chat_response', args: { response: message.content || 'I could not process that request.' } };
+    } catch (error) {
+        console.error('Alloe error:', error.message);
+        throw new Error(`Alloe Error: ${error.message}`);
+    }
+}
+
+async function executeAIAction(action, args) {
+    switch (action) {
+        case 'create_task': {
+            const result = await createJiraTask(args.title, args.priority);
+            let hasWarning = false;
+            let warningMsg = null;
+            
+            if (args.assignee) {
+                try {
+                    const searchName = TEAM_MEMBERS[args.assignee.toLowerCase()] || args.assignee;
+                    const user = await searchJiraUser(searchName);
+                    if (user) {
+                        await assignTicket(result.key, user.accountId);
+                        console.log(`   → Assigned to ${user.displayName}`);
+                    } else {
+                        hasWarning = true;
+                        warningMsg = `⚠️ Created ${result.key} but user "${args.assignee}" not found\n🔗 ${result.url}`;
+                    }
+                } catch (e) {
+                    hasWarning = true;
+                    warningMsg = `⚠️ Created ${result.key} but couldn't assign\n🔗 ${result.url}`;
+                }
+            }
+            
+            console.log(`   → Created ${result.key}`);
+            // Return ticket info so handler can upload attachments
+            return { 
+                reactOnly: !hasWarning, 
+                ticketKey: result.key,
+                response: warningMsg
+            };
+        }
+        
+        case 'get_tasks_by_priority': {
+            const tasks = await getTasksByPriority(args.priority);
+            return formatTaskList(tasks, `${args.priority.toUpperCase()} Tasks`);
+        }
+        
+        case 'get_tasks_by_assignee': {
+            const searchName = TEAM_MEMBERS[args.assignee.toLowerCase()] || args.assignee;
+            let tasks;
+            let title;
+            
+            if (args.status === 'pending') {
+                tasks = await getPendingTasksByAssignee(searchName);
+                title = `${args.assignee}'s Pending Tasks`;
+            } else if (args.status === 'all') {
+                tasks = await getAllTasksByAssignee(searchName);
+                title = `All ${args.assignee}'s Tasks`;
+            } else {
+                tasks = await getTasksByAssignee(searchName);
+                title = `${args.assignee}'s Open Tasks`;
+            }
+            return formatTaskList(tasks, title);
+        }
+        
+        case 'get_tasks_by_priority_and_assignee': {
+            const searchName = TEAM_MEMBERS[args.assignee.toLowerCase()] || args.assignee;
+            const tasks = await getTasksByPriorityAndAssignee(args.priority, searchName);
+            const title = `${args.assignee}'s ${args.priority.toUpperCase()} Tasks`;
+            return formatTaskList(tasks, title);
+        }
+        
+        case 'get_tasks_by_date': {
+            let tasks;
+            let title;
+            
+            if (args.date) {
+                tasks = await getTasksByDate(args.date);
+                title = `Tasks from ${args.date}`;
+            } else if (args.period === 'today') {
+                tasks = await getTodaysTasks();
+                title = "Today's Tasks";
+            } else if (args.period === 'yesterday') {
+                tasks = await getYesterdaysTasks();
+                title = "Yesterday's Tasks";
+            } else if (args.period === 'week') {
+                tasks = await getThisWeeksTasks();
+                title = "This Week's Tasks";
+            } else {
+                tasks = await getTodaysTasks();
+                title = "Today's Tasks";
+            }
+            return formatTaskList(tasks, title);
+        }
+        
+        case 'get_all_tasks': {
+            const tasks = args.include_done ? await getAllTasks() : await getAllOpenTasks();
+            const title = args.include_done ? 'All Tasks' : 'All Open Tasks';
+            return formatTaskList(tasks, title);
+        }
+        
+        case 'get_ticket_details': {
+            const ticketKey = args.ticket_key.toUpperCase();
+            const ticket = await getTicketDetails(ticketKey);
+            const fields = ticket.fields;
+            
+            const priority = fields.labels?.find(l => /^P\d$/i.test(l)) || 'N/A';
+            const status = fields.status?.name || 'Unknown';
+            const assignee = fields.assignee?.displayName || 'Unassigned';
+            
+            return `📋 *${ticketKey}*\n\n*Title:* ${fields.summary}\n*Priority:* ${priority}\n*Status:* ${status}\n*Assignee:* ${assignee}\n\n🔗 https://${JIRA_DOMAIN}/browse/${ticketKey}`;
+        }
+        
+        case 'mark_ticket_done': {
+            const ticketKey = args.ticket_key.toUpperCase();
+            await markTicketDone(ticketKey);
+            console.log(`   → ${ticketKey} marked as Done`);
+            return { reactOnly: true }; // Just react with ✅
+        }
+        
+        case 'chat_response': {
+            return args.response;
+        }
+        
+        default:
+            return '❌ Unknown action';
+    }
 }
 
 // ============================================
@@ -387,7 +727,7 @@ function initializeClient() {
         try {
             // #help
             if (command === '#help') {
-                await message.reply(`🤖 *Jira Bot Commands*\n
+                await message.reply(`🤖 *Alloe Commands*\n
 *Add Tasks:*
 #addP0 <title> - Critical
 #addP1 <title> - Highest
@@ -430,6 +770,15 @@ function initializeClient() {
 #history 50 - Last 50 messages
 #search keyword - Search messages
 
+*Alloe (Natural Language):*
+#ask <question> - Talk to Alloe!
+  • #ask create P1 task for login bug
+  • #ask add task about payment =suhan
+  • #ask show suhan's pending tasks
+  • #ask what are the P0 tasks?
+  • #ask mark KAN-5 as done
+  • #ask summarize last discussion
+
 *Other:*
 #ping - Check bot
 #status - Bot status
@@ -456,10 +805,11 @@ function initializeClient() {
             }
             
             // #addP0, #addP1, #addP2, #addP3, #addP4, #addP5 <task> [@assignee]
-            else if (/^#addp[0-5]\s/.test(command)) {
-                const match = body.match(/^#addp([0-5])\s+(.+)$/i);
+            else if (/^#addp[0-5](\s|$)/i.test(command)) {
+                // Match command with optional multi-line content
+                const match = body.match(/^#addp([0-5])[\s\n]+(.+)/is);
                 
-                if (!match) {
+                if (!match || !match[2]?.trim()) {
                     await message.reply('❌ Format: #addP1 Task title here\nWith assignee: #addP1 Task title =suhan');
                     return;
                 }
@@ -776,6 +1126,119 @@ function initializeClient() {
                 console.log(`   → Found ${matches.length} messages for "${query}"`);
             }
             
+            // #ask <question> - Alloe assistant for chat analysis and Jira commands
+            else if (command.startsWith('#ask ') || command.startsWith('#ask\n') || command === '#ask') {
+                // Extract query - handle both "#ask query" and "#ask\nquery"
+                const query = body.replace(/^#ask[\s\n]*/i, '').trim();
+                
+                if (!query) {
+                    await message.reply(`🤖 *Hey, I'm Alloe!* Your Lifemaxing AI
+
+*Ask me to manage Jira:*
+• #ask create a P1 task for login bug
+• #ask add urgent task about payment assign to suhan
+• #ask show suhan's tasks
+• #ask what are the P0 tasks?
+• #ask mark KAN-5 as done
+• #ask show today's tasks
+
+*Or ask about the chat:*
+• #ask summarize the last discussion
+• #ask what was decided?
+• #ask who mentioned the bug?`);
+                    return;
+                }
+                
+                // Check if OpenAI is configured
+                if (!process.env.OPENAI_API_KEY) {
+                    await message.reply('❌ Alloe is not configured yet. Add OPENAI_API_KEY to .env');
+                    return;
+                }
+                
+                // React with 🤔 to show we're processing
+                try {
+                    await message.react('🤔');
+                } catch (e) {}
+                
+                try {
+                    // Fetch recent messages for context
+                    const chat = await message.getChat();
+                    const chatMessages = await chat.fetchMessages({ limit: 30 });
+                    
+                    console.log(`   → Alloe processing: "${query.substring(0, 50)}..."`);
+                    
+                    // Get Alloe to determine intent and action
+                    const { action, args } = await processAIRequest(chatMessages, query);
+                    console.log(`   → Alloe detected action: ${action}`, args);
+                    
+                    // Execute the action
+                    const result = await executeAIAction(action, args);
+                    console.log(`   → Alloe result type: ${typeof result}`);
+                    
+                    // If task was created, check for attachments
+                    if (action === 'create_task' && result?.ticketKey) {
+                        // Check if message has media (image attached)
+                        if (message.hasMedia) {
+                            try {
+                                const media = await message.downloadMedia();
+                                if (media) {
+                                    const ext = media.mimetype.split('/')[1] || 'jpg';
+                                    const filename = `whatsapp_${Date.now()}.${ext}`;
+                                    await uploadAttachmentToJira(result.ticketKey, media.data, filename);
+                                    console.log(`   → Attachment uploaded to ${result.ticketKey}`);
+                                }
+                            } catch (err) {
+                                console.error('Attachment error:', err.message);
+                            }
+                        }
+                        
+                        // Check if replying to a message with media
+                        if (message.hasQuotedMsg) {
+                            try {
+                                const quotedMsg = await message.getQuotedMessage();
+                                if (quotedMsg.hasMedia) {
+                                    const media = await quotedMsg.downloadMedia();
+                                    if (media) {
+                                        const ext = media.mimetype.split('/')[1] || 'jpg';
+                                        const filename = `whatsapp_${Date.now()}.${ext}`;
+                                        await uploadAttachmentToJira(result.ticketKey, media.data, filename);
+                                        console.log(`   → Quoted attachment uploaded to ${result.ticketKey}`);
+                                    }
+                                }
+                            } catch (err) {
+                                console.error('Quoted attachment error:', err.message);
+                            }
+                        }
+                    }
+                    
+                    // Handle different result types
+                    if (result && typeof result === 'object' && result.reactOnly) {
+                        // Just react with ✅ (for create/done actions)
+                        try { await message.react('✅'); } catch (e) {}
+                    } else if (result && typeof result === 'object' && result.response) {
+                        // Has a specific response (like a warning)
+                        await message.reply(result.response);
+                        try { await message.react('✅'); } catch (e) {}
+                    } else if (action === 'chat_response') {
+                        // Chat/general response - add Alloe branding
+                        await message.reply(`🤖 *Alloe*\n\n${result}`);
+                        try { await message.react('✅'); } catch (e) {}
+                    } else if (typeof result === 'string' && result.length > 0) {
+                        // Jira fetch results - send as-is
+                        await message.reply(result);
+                        try { await message.react('✅'); } catch (e) {}
+                    } else {
+                        await message.reply('✅ Done');
+                    }
+                    
+                    console.log(`   → Alloe completed: ${action}`);
+                } catch (askError) {
+                    console.error('Alloe error:', askError);
+                    await message.reply(`❌ Alloe Error: ${askError.message}`);
+                    try { await message.react('❌'); } catch (e) {}
+                }
+            }
+            
         } catch (error) {
             console.error('Command error:', error.message);
             await message.reply(`❌ Error: ${error.message}`);
@@ -809,8 +1272,9 @@ app.get('/status', (req, res) => {
 app.listen(PORT, () => {
     console.log(`\n🌐 Server: http://localhost:${PORT}`);
     console.log(`\n📋 Jira: ${JIRA_DOMAIN} (${JIRA_PROJECT_KEY})`);
+    console.log(`🤖 Alloe AI: ${process.env.OPENAI_API_KEY ? 'Ready' : 'Not configured (add OPENAI_API_KEY)'}`);
     console.log(`👀 Watching: ${WATCHED_CONTACT}`);
-    console.log(`\n💬 Commands: #help #addP1 <task> #today #p1 #tasks\n`);
+    console.log(`\n💬 Commands: #help #addP1 <task> #today #p1 #tasks #ask\n`);
     
     initializeClient();
 });
