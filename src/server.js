@@ -48,6 +48,8 @@ let clientInfo = null;
 
 const incomingMessages = [];
 const WATCHED_CONTACT = 'Alloe.Life Product Engineering';
+/** WhatsApp group name used for system monitoring alerts (API posts messages here). */
+const MONITORING_GROUP_NAME = 'Alloe System Monitoring';
 
 // Team members for quick assignment (shortcut -> search name)
 const TEAM_MEMBERS = {
@@ -1263,6 +1265,92 @@ app.get('/status', (req, res) => {
         user: clientInfo?.pushname || null,
         jira: { domain: JIRA_DOMAIN, project: JIRA_PROJECT_KEY }
     });
+});
+
+/**
+ * POST /api/monitoring/message
+ *
+ * Sends a text message to the "Alloe System Monitoring" WhatsApp group.
+ * Use this for alerts, status updates, or any system notifications.
+ *
+ * Request:
+ *   - Method: POST
+ *   - Content-Type: application/json
+ *   - Body: { "message": "<string>" }
+ *
+ * The message supports full Unicode (emojis, special characters, etc.).
+ * No encoding required; send the exact text you want in the group.
+ *
+ * Success (200):
+ *   { "success": true, "messageId": "...", "timestamp": <number>, "group": "Alloe System Monitoring" }
+ *
+ * Errors:
+ *   - 400: Missing or empty "message" in body
+ *   - 404: Group "Alloe System Monitoring" not found (e.g. not in chat list)
+ *   - 503: WhatsApp client not ready (not logged in or QR not scanned)
+ *   - 500: Send failed (network/WhatsApp error)
+ *
+ * Example:
+ *   curl -X POST http://localhost:3000/api/monitoring/message \
+ *     -H "Content-Type: application/json" \
+ *     -d '{"message": "Server OK ✅"}'
+ */
+app.post('/api/monitoring/message', async (req, res) => {
+    try {
+        // Require an active WhatsApp session
+        if (!isReady || !client) {
+            return res.status(503).json({
+                success: false,
+                error: 'WhatsApp client not ready. Scan QR or wait for connection.'
+            });
+        }
+
+        // Validate required body field
+        const message = req.body?.message;
+        if (message === undefined || message === null) {
+            return res.status(400).json({
+                success: false,
+                error: 'Missing "message" in request body. Send JSON: { "message": "your text" }'
+            });
+        }
+
+        const messageText = String(message).trim();
+        if (!messageText) {
+            return res.status(400).json({
+                success: false,
+                error: 'Message cannot be empty'
+            });
+        }
+
+        // Resolve group by name (case-insensitive partial match)
+        const chats = await client.getChats();
+        const group = chats.find(chat =>
+            chat.isGroup &&
+            chat.name.toLowerCase().includes(MONITORING_GROUP_NAME.toLowerCase())
+        );
+
+        if (!group) {
+            return res.status(404).json({
+                success: false,
+                error: `Group "${MONITORING_GROUP_NAME}" not found`
+            });
+        }
+
+        const result = await client.sendMessage(group.id._serialized, messageText);
+
+        res.json({
+            success: true,
+            messageId: result.id._serialized,
+            timestamp: result.timestamp,
+            group: group.name
+        });
+    } catch (error) {
+        console.error('Error posting to monitoring group:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to send message'
+        });
+    }
 });
 
 // ============================================
